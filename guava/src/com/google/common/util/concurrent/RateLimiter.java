@@ -42,7 +42,7 @@ import javax.annotation.concurrent.ThreadSafe;
  * physical or logical resource is accessed. This is in contrast to {@link
  * java.util.concurrent.Semaphore} which restricts the number of concurrent
  * accesses instead of the rate (note though that concurrency and rate are closely related,
- * e.g. see <a href="http://en.wikipedia.org/wiki/Little's_law">Little's Law</a>).
+ * e.g. see <a href="http://en.wikipedia.org/wiki/Little%27s_law">Little's Law</a>).
  *
  * <p>A {@code RateLimiter} is defined primarily by the rate at which permits
  * are issued. Absent additional configuration, permits will be distributed at a
@@ -78,7 +78,7 @@ import javax.annotation.concurrent.ThreadSafe;
  *}</pre>
  *
  * <p>It is important to note that the number of permits requested <i>never</i>
- * affect the throttling of the request itself (an invocation to {@code acquire(1)}
+ * affects the throttling of the request itself (an invocation to {@code acquire(1)}
  * and an invocation to {@code acquire(1000)} will result in exactly the same throttling, if any),
  * but it affects the throttling of the <i>next</i> request. I.e., if an expensive task
  * arrives at an idle RateLimiter, it will be granted immediately, but it is the <i>next</i>

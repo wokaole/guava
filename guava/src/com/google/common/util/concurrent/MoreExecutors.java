@@ -243,7 +243,7 @@ public final class MoreExecutors {
 
   /**
    * Creates an executor service that runs each task in the thread
-   * that invokes {@code execute/submit}, as in {@link CallerRunsPolicy}  This
+   * that invokes {@code execute/submit}, as in {@link CallerRunsPolicy}.  This
    * applies both to individually submitted tasks and to collections of tasks
    * submitted via {@code invokeAll} or {@code invokeAny}.  In the latter case,
    * tasks will run serially on the calling thread.  Tasks are run to
@@ -271,7 +271,7 @@ public final class MoreExecutors {
    * RejectedExecutionException, although a subset of the tasks may already
    * have been executed.
    *
-   * @since 10.0 (<a href="http://code.google.com/p/guava-libraries/wiki/Compatibility"
+   * @since 10.0 (<a href="https://github.com/google/guava/wiki/Compatibility"
    *        >mostly source-compatible</a> since 3.0)
    * @deprecated Use {@link #directExecutor()} if you only require an {@link Executor} and
    *     {@link #newDirectExecutorService()} if you need a {@link ListeningExecutorService}. This
@@ -285,7 +285,7 @@ public final class MoreExecutors {
 
   // See sameThreadExecutor javadoc for behavioral notes.
   @GwtIncompatible("TODO")
-  private static class DirectExecutorService
+  private static final class DirectExecutorService
       extends AbstractListeningExecutorService {
     /**
      * Lock used whenever accessing the state variables
@@ -455,6 +455,10 @@ public final class MoreExecutors {
     @Override public void execute(Runnable command) {
       command.run();
     }
+
+    @Override public String toString() {
+      return "MoreExecutors.directExecutor()";
+    }
   }
 
   /**
@@ -522,39 +526,39 @@ public final class MoreExecutors {
     }
 
     @Override
-    public boolean awaitTermination(long timeout, TimeUnit unit)
+    public final boolean awaitTermination(long timeout, TimeUnit unit)
         throws InterruptedException {
       return delegate.awaitTermination(timeout, unit);
     }
 
     @Override
-    public boolean isShutdown() {
+    public final boolean isShutdown() {
       return delegate.isShutdown();
     }
 
     @Override
-    public boolean isTerminated() {
+    public final boolean isTerminated() {
       return delegate.isTerminated();
     }
 
     @Override
-    public void shutdown() {
+    public final void shutdown() {
       delegate.shutdown();
     }
 
     @Override
-    public List<Runnable> shutdownNow() {
+    public final List<Runnable> shutdownNow() {
       return delegate.shutdownNow();
     }
 
     @Override
-    public void execute(Runnable command) {
+    public final void execute(Runnable command) {
       delegate.execute(command);
     }
   }
 
   @GwtIncompatible("TODO")
-  private static class ScheduledListeningDecorator
+  private static final class ScheduledListeningDecorator
       extends ListeningDecorator implements ListeningScheduledExecutorService {
     @SuppressWarnings("hiding")
     final ScheduledExecutorService delegate;
@@ -935,16 +939,14 @@ public final class MoreExecutors {
    *  <li>waits for the other half of the specified timeout.
    * </ol>
    *
-   * <p>If, at any step of the process, the given executor is terminated or the calling thread is
-   * interrupted, the method calls {@link ExecutorService#shutdownNow()}, cancelling
-   * pending tasks and interrupting running tasks.
+   * <p>If, at any step of the process, the calling thread is interrupted, the method calls {@link
+   * ExecutorService#shutdownNow()} and returns.
    *
    * @param service the {@code ExecutorService} to shut down
    * @param timeout the maximum time to wait for the {@code ExecutorService} to terminate
    * @param unit the time unit of the timeout argument
-   * @return {@code true} if the pool was terminated successfully, {@code false} if the
-   *     {@code ExecutorService} could not terminate <b>or</b> the thread running this method
-   *     is interrupted while waiting for the {@code ExecutorService} to terminate
+   * @return {@code true} if the {@code ExecutorService} was terminated successfully, {@code false}
+   *     the call timed out or was interrupted
    * @since 17.0
    */
   @Beta

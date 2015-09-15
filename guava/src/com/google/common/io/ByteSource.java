@@ -20,6 +20,8 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 
 import com.google.common.annotations.Beta;
+import com.google.common.base.Ascii;
+import com.google.common.base.Optional;
 import com.google.common.collect.ImmutableList;
 import com.google.common.hash.Funnels;
 import com.google.common.hash.HashCode;
@@ -103,7 +105,10 @@ public abstract class ByteSource {
 
   /**
    * Returns a view of a slice of this byte source that is at most {@code length} bytes long
-   * starting at the given {@code offset}.
+   * starting at the given {@code offset}. If {@code offset} is greater than the size of this
+   * source, the returned source will be empty. If {@code offset + length} is greater than the size
+   * of this source, the returned source will contain the slice starting at {@code offset} and
+   * ending at the end of this source.
    *
    * @throws IllegalArgumentException if {@code offset} or {@code length} is negative
    */
@@ -112,13 +117,23 @@ public abstract class ByteSource {
   }
 
   /**
-   * Returns whether the source has zero bytes. The default implementation is to open a stream and
-   * check for EOF.
+   * Returns whether the source has zero bytes. The default implementation returns true if
+   * {@link #sizeIfKnown} returns zero, falling back to opening a stream and checking for
+   * EOF if the size is not known.
+   *
+   * <p>Note that, in cases where {@code sizeIfKnown} returns zero, it is <i>possible</i> that bytes
+   * are actually available for reading. (For example, some special files may return a size of 0
+   * despite actually having content when read.) This means that a source may return {@code true}
+   * from {@code isEmpty()} despite having readable content.
    *
    * @throws IOException if an I/O error occurs
    * @since 15.0
    */
   public boolean isEmpty() throws IOException {
+    Optional<Long> sizeIfKnown = sizeIfKnown();
+    if (sizeIfKnown.isPresent() && sizeIfKnown.get() == 0L) {
+      return true;
+    }
     Closer closer = Closer.create();
     try {
       InputStream in = closer.register(openStream());
@@ -131,21 +146,49 @@ public abstract class ByteSource {
   }
 
   /**
-   * Returns the size of this source in bytes. For most implementations, this is a heavyweight
-   * operation that will open a stream, read (or {@link InputStream#skip(long) skip}, if possible)
-   * to the end of the stream and return the total number of bytes that were read.
+   * Returns the size of this source in bytes, if the size can be easily determined without
+   * actually opening the data stream.
    *
-   * <p>For some sources, such as a file, this method may use a more efficient implementation. Note
-   * that in such cases, it is <i>possible</i> that this method will return a different number of
-   * bytes than would be returned by reading all of the bytes (for example, some special files may
-   * return a size of 0 despite actually having content when read).
+   * <p>The default implementation returns {@link Optional#absent}. Some sources, such as a file,
+   * may return a non-absent value. Note that in such cases, it is <i>possible</i> that this method
+   * will return a different number of bytes than would be returned by reading all of the bytes (for
+   * example, some special files may return a size of 0 despite actually having content when read).
    *
-   * <p>In either case, if this is a mutable source such as a file, the size it returns may not be
-   * the same number of bytes a subsequent read would return.
+   * <p>Additionally, for mutable sources such as files, a subsequent read may return a different
+   * number of bytes if the contents are changed.
+   *
+   * @since 19.0
+   */
+  @Beta
+  public Optional<Long> sizeIfKnown() {
+    return Optional.absent();
+  }
+
+  /**
+   * Returns the size of this source in bytes, even if doing so requires opening and traversing
+   * an entire stream. To avoid a potentially expensive operation, see {@link #sizeIfKnown}.
+   *
+   * <p>The default implementation calls {@link #sizeIfKnown} and returns the value if present.
+   * If absent, it will fall back to a heavyweight operation that will open a stream, read (or
+   * {@link InputStream#skip(long) skip}, if possible) to the end of the stream and return the total
+   * number of bytes that were read.
+   *
+   * <p>Note that for some sources that implement {@link #sizeIfKnown} to provide a more efficient
+   * implementation, it is <i>possible</i> that this method will return a different number of bytes
+   * than would be returned by reading all of the bytes (for example, some special files may return
+   * a size of 0 despite actually having content when read).
+   *
+   * <p>In either case, for mutable sources such as files, a subsequent read may return a different
+   * number of bytes if the contents are changed.
    *
    * @throws IOException if an I/O error occurs in the process of reading the size of this source
    */
   public long size() throws IOException {
+    Optional<Long> sizeIfKnown = sizeIfKnown();
+    if (sizeIfKnown.isPresent()) {
+      return sizeIfKnown.get();
+    }
+
     Closer closer = Closer.create();
     try {
       InputStream in = closer.register(openStream());
@@ -452,8 +495,9 @@ public abstract class ByteSource {
 
     private InputStream sliceStream(InputStream in) throws IOException {
       if (offset > 0) {
+        long skipped;
         try {
-          ByteStreams.skipFully(in, offset);
+          skipped = ByteStreams.skipUpTo(in, offset);
         } catch (Throwable e) {
           Closer closer = Closer.create();
           closer.register(in);
@@ -462,6 +506,12 @@ public abstract class ByteSource {
           } finally {
             closer.close();
           }
+        }
+
+        if (skipped < offset) {
+          // offset was beyond EOF
+          in.close();
+          return new ByteArrayInputStream(new byte[0]);
         }
       }
       return ByteStreams.limit(in, length);
@@ -478,6 +528,17 @@ public abstract class ByteSource {
     @Override
     public boolean isEmpty() throws IOException {
       return length == 0 || super.isEmpty();
+    }
+
+    @Override
+    public Optional<Long> sizeIfKnown() {
+      Optional<Long> optionalUnslicedSize = ByteSource.this.sizeIfKnown();
+      if (optionalUnslicedSize.isPresent()) {
+        long unslicedSize = optionalUnslicedSize.get();
+        long off = Math.min(offset, unslicedSize);
+        return Optional.of(Math.min(length, unslicedSize - off));
+      }
+      return Optional.absent();
     }
 
     @Override
@@ -524,6 +585,11 @@ public abstract class ByteSource {
     }
 
     @Override
+    public Optional<Long> sizeIfKnown() {
+      return Optional.of((long) length);
+    }
+
+    @Override
     public byte[] read() {
       return Arrays.copyOfRange(bytes, offset, offset + length);
     }
@@ -550,77 +616,16 @@ public abstract class ByteSource {
       checkArgument(offset >= 0, "offset (%s) may not be negative", offset);
       checkArgument(length >= 0, "length (%s) may not be negative", length);
 
-      int newOffset = this.offset + (int) Math.min(this.length, offset);
-      int endOffset = this.offset + (int) Math.min(this.length, offset + length);
-      return new ByteArrayByteSource(bytes, newOffset, endOffset - newOffset);
+      offset = Math.min(offset, this.length);
+      length = Math.min(length, this.length - offset);
+      int newOffset = this.offset + (int) offset;
+      return new ByteArrayByteSource(bytes, newOffset, (int) length);
     }
 
     @Override
     public String toString() {
       return "ByteSource.wrap("
-          + truncate(BaseEncoding.base16().encode(bytes, offset, length), 30, "...") + ")";
-    }
-
-    /**
-     * Truncates the given character sequence to the given maximum length. If the length of the
-     * sequence is greater than {@code maxLength}, the returned string will be exactly
-     * {@code maxLength} chars in length and will end with the given {@code truncationIndicator}.
-     * Otherwise, the sequence will be returned as a string with no changes to the content.
-     *
-     * <p>Examples:
-     *
-     * <pre>   {@code
-     *   truncate("foobar", 7, "..."); // returns "foobar"
-     *   truncate("foobar", 5, "..."); // returns "fo..." }</pre>
-     *
-     * <p><b>Note:</b> This method <i>may</i> work with certain non-ASCII text but is not safe for
-     * use with arbitrary Unicode text. It is mostly intended for use with text that is known to be
-     * safe for use with it (such as all-ASCII text) and for simple debugging text. When using this
-     * method, consider the following:
-     *
-     * <ul>
-     *   <li>it may split surrogate pairs</li>
-     *   <li>it may split characters and combining characters</li>
-     *   <li>it does not consider word boundaries</li>
-     *   <li>if truncating for display to users, there are other considerations that must be taken
-     *   into account</li>
-     *   <li>the appropriate truncation indicator may be locale-dependent</li>
-     *   <li>it is safe to use non-ASCII characters in the truncation indicator</li>
-     * </ul>
-     *
-     *
-     * @throws IllegalArgumentException if {@code maxLength} is less than the length of
-     *     {@code truncationIndicator}
-     */
-    /*
-     * <p>TODO(user, cpovirk): Use Ascii.truncate once it is available in our internal copy of
-     * guava_jdk5.
-     */
-    private static String truncate(CharSequence seq, int maxLength, String truncationIndicator) {
-      checkNotNull(seq);
-
-      // length to truncate the sequence to, not including the truncation indicator
-      int truncationLength = maxLength - truncationIndicator.length();
-
-      // in this worst case, this allows a maxLength equal to the length of the truncationIndicator,
-      // meaning that a string will be truncated to just the truncation indicator itself
-      checkArgument(truncationLength >= 0,
-          "maxLength (%s) must be >= length of the truncation indicator (%s)",
-          maxLength, truncationIndicator.length());
-
-      if (seq.length() <= maxLength) {
-        String string = seq.toString();
-        if (string.length() <= maxLength) {
-          return string;
-        }
-        // if the length of the toString() result was > maxLength for some reason, truncate that
-        seq = string;
-      }
-
-      return new StringBuilder(maxLength)
-          .append(seq, 0, truncationLength)
-          .append(truncationIndicator)
-          .toString();
+          + Ascii.truncate(BaseEncoding.base16().encode(bytes, offset, length), 30, "...") + ")";
     }
   }
 
@@ -670,6 +675,19 @@ public abstract class ByteSource {
         }
       }
       return true;
+    }
+
+    @Override
+    public Optional<Long> sizeIfKnown() {
+      long result = 0L;
+      for (ByteSource source : sources) {
+        Optional<Long> sizeIfKnown = source.sizeIfKnown();
+        if (!sizeIfKnown.isPresent()) {
+          return Optional.absent();
+        }
+        result += sizeIfKnown.get();
+      }
+      return Optional.of(result);
     }
 
     @Override

@@ -30,6 +30,7 @@ import java.security.PrivilegedExceptionAction;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
@@ -40,26 +41,19 @@ import java.util.logging.Logger;
 import javax.annotation.Nullable;
 
 /**
- * An abstract implementation of the {@link ListenableFuture} interface. This
- * class is preferable to {@link java.util.concurrent.FutureTask} for two
- * reasons: It implements {@code ListenableFuture}, and it does not implement
- * {@code Runnable}. (If you want a {@code Runnable} implementation of {@code
- * ListenableFuture}, create a {@link ListenableFutureTask}, or submit your
- * tasks to a {@link ListeningExecutorService}.)
+ * An abstract implementation of {@link ListenableFuture}, intended for advanced users only. More
+ * common ways to create a {@code ListenableFuture} include instantiating a {@link SettableFuture},
+ * submitting a task to a {@link ListeningExecutorService}, and deriving a {@code Future} from an
+ * existing one, typically using methods like {@link Futures#transform(ListenableFuture, Function)
+ * Futures.transform} and {@link Futures#catching(ListenableFuture, Class, Function)
+ * Futures.catching}.
  *
- * <p>This class implements all methods in {@code ListenableFuture}.
- * Subclasses should provide a way to set the result of the computation through
- * the protected methods {@link #set(Object)},
- * {@link #setFuture(ListenableFuture)} and {@link #setException(Throwable)}.
- * Subclasses may also override {@link #interruptTask()}, which will be invoked
- * automatically if a call to {@link #cancel(boolean) cancel(true)} succeeds in
- * canceling the future.
- *
- * <p>Subclasses should rarely override other methods. Instead, prefer designs
- * that derive a new {@code Future} to return to clients, typically using
- * methods like {@link Futures#transform(ListenableFuture, AsyncFunction)
- * Futures.transform} and {@link Futures#withFallback(ListenableFuture,
- * FutureFallback) Futures.withFallback}.
+ * <p>This class implements all methods in {@code ListenableFuture}. Subclasses should provide a way
+ * to set the result of the computation through the protected methods {@link #set(Object)}, {@link
+ * #setFuture(ListenableFuture)} and {@link #setException(Throwable)}. Subclasses may also override
+ * {@link #interruptTask()}, which will be invoked automatically if a call to {@link
+ * #cancel(boolean) cancel(true)} succeeds in canceling the future. Subclasses should rarely
+ * override other methods.
  *
  * @author Sven Mawson
  * @author Luke Sandberg
@@ -115,7 +109,7 @@ public abstract class AbstractFuture<V> implements ListenableFuture<V> {
   static {
     AtomicHelper helper = null;
     try {
-      helper = new UnsafeAtomicHelper();
+      helper = UnsafeAtomicHelperFactory.values()[0].tryCreateUnsafeAtomicHelper();
     } catch (Throwable e) {
       // catch absolutely everything and fall through
     }
@@ -153,7 +147,7 @@ public abstract class AbstractFuture<V> implements ListenableFuture<V> {
 
     // Constructor for the TOMBSTONE, avoids use of ATOMIC_HELPER in case this class is loaded
     // before the ATOMIC_HELPER.  Apparently this is possible on some android platforms.
-    Waiter(@SuppressWarnings("unused") boolean ignored) {}
+    Waiter(boolean unused) {}
 
     Waiter() {
       // avoid volatile write, write is made visible by subsequent CAS on waiters field
@@ -771,6 +765,29 @@ public abstract class AbstractFuture<V> implements ListenableFuture<V> {
    */
   void done() {}
 
+  /**
+   * Returns the exception that this {@code Future} completed with. This includes completion through
+   * a call to {@link setException} or {@link setFuture}{@code (failedFuture)} but not cancellation.
+   *
+   * @throws RuntimeException if the {@code Future} has not failed
+   */
+  final Throwable trustedGetException() {
+    return ((Failure) value).exception;
+  }
+
+  /**
+   * If this future has been cancelled (and possibly interrupted), cancels (and possibly interrupts)
+   * the given future (if available).
+   *
+   * <p>This method should be used only when this future is completed. It is designed to be called
+   * from {@code done}.
+   */
+  final void maybePropagateCancellation(@Nullable Future<?> related) {
+    if (related != null & isCancelled()) {
+      related.cancel(wasInterrupted());
+    }
+  }
+
   /** Clears the {@link #waiters} list and returns the most recently added value. */
   private Waiter clearWaiters() {
     Waiter head;
@@ -830,11 +847,39 @@ public abstract class AbstractFuture<V> implements ListenableFuture<V> {
   }
 
   /**
+   * Temporary hack to hide the reference to {@link UnsafeAtomicHelper} from Android. The caller of
+   * this code will execute {@link #tryCreateUnsafeAtomicHelper} on the <b>first</b> enum value
+   * present. On the server, this will try to create {@link UnsafeAtomicHelper}. On Android, it will
+   * just return {@code null}.
+   */
+  private enum UnsafeAtomicHelperFactory {
+    @SuppressUnderAndroid // temporarily while we make Proguard tolerate Unsafe
+    REALLY_TRY_TO_CREATE {
+      @Override
+      AtomicHelper tryCreateUnsafeAtomicHelper() {
+        return new UnsafeAtomicHelper();
+      }
+    },
+
+    DONT_EVEN_TRY_TO_CREATE {
+      @Override
+      AtomicHelper tryCreateUnsafeAtomicHelper() {
+        return null;
+      }
+    },
+
+  ;
+
+    abstract AtomicHelper tryCreateUnsafeAtomicHelper();
+  }
+
+  /**
    * {@link AtomicHelper} based on {@link sun.misc.Unsafe}.
    *
    * <p>Static initialization of this class will fail if the {@link sun.misc.Unsafe} object cannot
    * be accessed.
    */
+  @SuppressUnderAndroid // temporarily while we make Proguard tolerate Unsafe
   private static final class UnsafeAtomicHelper extends AtomicHelper {
     static final sun.misc.Unsafe UNSAFE;
     static final long LISTENERS_OFFSET;
@@ -880,26 +925,31 @@ public abstract class AbstractFuture<V> implements ListenableFuture<V> {
       }
     }
 
-    @Override void putThread(Waiter waiter, Thread thread) {
+    @Override
+    void putThread(Waiter waiter, Thread thread) {
       UNSAFE.putObject(waiter, WAITER_THREAD_OFFSET, thread);
     }
 
-    @Override void putNext(Waiter waiter, Waiter next) {
+    @Override
+    void putNext(Waiter waiter, Waiter next) {
       UNSAFE.putObject(waiter, WAITER_NEXT_OFFSET, next);
     }
 
     /** Performs a CAS operation on the {@link #waiters} field. */
-    @Override boolean casWaiters(AbstractFuture future, Waiter curr, Waiter next) {
+    @Override
+    boolean casWaiters(AbstractFuture future, Waiter curr, Waiter next) {
       return UNSAFE.compareAndSwapObject(future, WAITERS_OFFSET, curr, next);
     }
 
     /** Performs a CAS operation on the {@link #listeners} field. */
-    @Override boolean casListeners(AbstractFuture future, Listener curr, Listener next) {
+    @Override
+    boolean casListeners(AbstractFuture future, Listener curr, Listener next) {
       return UNSAFE.compareAndSwapObject(future, LISTENERS_OFFSET, curr, next);
     }
 
     /** Performs a CAS operation on the {@link #value} field. */
-    @Override boolean casValue(AbstractFuture future, Object expected, Object v) {
+    @Override
+    boolean casValue(AbstractFuture future, Object expected, Object v) {
       return UNSAFE.compareAndSwapObject(future, VALUE_OFFSET, expected, v);
     }
   }

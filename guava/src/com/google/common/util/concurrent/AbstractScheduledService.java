@@ -22,6 +22,7 @@ import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 
 import com.google.common.annotations.Beta;
 import com.google.common.base.Supplier;
+import com.google.j2objc.annotations.WeakOuter;
 
 import java.util.concurrent.Callable;
 import java.util.concurrent.Executor;
@@ -160,7 +161,10 @@ public abstract class AbstractScheduledService implements Service {
   }
   
   /* use AbstractService for state management */
-  private final AbstractService delegate = new AbstractService() {
+  private final AbstractService delegate = new ServiceDelegate();
+
+  @WeakOuter
+  private final class ServiceDelegate extends AbstractService {
     
     // A handle to the running task so that we can stop it when a shutdown has been requested.
     // These two fields are volatile because their values will be accessed from multiple threads.
@@ -196,7 +200,7 @@ public abstract class AbstractScheduledService implements Service {
           lock.unlock();
         }
       }
-    };
+    }
 
     private final Runnable task = new Task();
 
@@ -251,8 +255,12 @@ public abstract class AbstractScheduledService implements Service {
         }
       });
     }
-  };
-  
+    
+    @Override public String toString() {
+      return AbstractScheduledService.this.toString();
+    }
+  }
+
   /** Constructor for use by subclasses. */
   protected AbstractScheduledService() {}
 
@@ -299,12 +307,13 @@ public abstract class AbstractScheduledService implements Service {
    * {@linkplain Service.State#TERMINATED fails}.
    */
   protected ScheduledExecutorService executor() {
-    final ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(
-        new ThreadFactory() {
-          @Override public Thread newThread(Runnable runnable) {
-            return MoreExecutors.newThread(serviceName(), runnable);
-          }
-        });
+    @WeakOuter class ThreadFactoryImpl implements ThreadFactory {
+      @Override public Thread newThread(Runnable runnable) {
+        return MoreExecutors.newThread(serviceName(), runnable);
+      }
+    }
+    final ScheduledExecutorService executor =
+        Executors.newSingleThreadScheduledExecutor(new ThreadFactoryImpl());
     // Add a listener to shutdown the executor after the service is stopped.  This ensures that the
     // JVM shutdown will not be prevented from exiting after this service has stopped or failed.
     // Technically this listener is added after start() was called so it is a little gross, but it
@@ -458,14 +467,22 @@ public abstract class AbstractScheduledService implements Service {
        * Atomically reschedules this task and assigns the new future to {@link #currentFuture}.
        */
       public void reschedule() {
+        // invoke the callback outside the lock, prevents some shenanigans.
+        Schedule schedule;
+        try {
+          schedule = CustomScheduler.this.getNextSchedule();
+        } catch (Throwable t) {
+          service.notifyFailed(t);
+          return;
+        }
         // We reschedule ourselves with a lock held for two reasons. 1. we want to make sure that
         // cancel calls cancel on the correct future. 2. we want to make sure that the assignment
         // to currentFuture doesn't race with itself so that currentFuture is assigned in the 
         // correct order.
+        Throwable scheduleFailure = null;
         lock.lock();
         try {
           if (currentFuture == null || !currentFuture.isCancelled()) {
-            final Schedule schedule = CustomScheduler.this.getNextSchedule();
             currentFuture = executor.schedule(this, schedule.delay, schedule.unit);
           }
         } catch (Throwable e) {
@@ -474,9 +491,16 @@ public abstract class AbstractScheduledService implements Service {
           // because the service does not monitor the state of the future so if the exception is not
           // caught and forwarded to the service the task would stop executing but the service would
           // have no idea.
-          service.notifyFailed(e);
+          // TODO(lukes): consider building everything in terms of ListenableScheduledFuture then
+          // the AbstractService could monitor the future directly.  Rescheduling is still hard...
+          // but it would help with some of these lock ordering issues.
+          scheduleFailure = e;
         } finally {
           lock.unlock();
+        }
+        // Call notifyFailed outside the lock to avoid lock ordering issues.
+        if (scheduleFailure != null) {
+          service.notifyFailed(scheduleFailure);
         }
       }
       

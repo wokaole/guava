@@ -44,13 +44,14 @@ import java.util.List;
  */
 public class CharSourceTest extends IoTestCase {
 
+  @SuppressUnderAndroid // Android doesn't understand suites whose tests lack default constructors.
   public static TestSuite suite() {
     TestSuite suite = new TestSuite();
     suite.addTest(CharSourceTester.tests("CharSource.wrap[CharSequence]",
         SourceSinkFactories.stringCharSourceFactory()));
     suite.addTest(CharSourceTester.tests("CharSource.empty[]",
         SourceSinkFactories.emptyCharSourceFactory()));
-    suite.addTestSuite(CharStreamsTest.class);
+    suite.addTestSuite(CharSourceTest.class);
     return suite;
   }
 

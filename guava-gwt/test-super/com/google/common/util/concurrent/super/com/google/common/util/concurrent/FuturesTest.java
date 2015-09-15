@@ -16,14 +16,19 @@
 
 package com.google.common.util.concurrent;
 
+import static com.google.common.collect.Iterables.getOnlyElement;
 import static com.google.common.truth.Truth.assertThat;
+import static com.google.common.util.concurrent.Futures.allAsList;
 import static com.google.common.util.concurrent.Futures.immediateFailedFuture;
 import static com.google.common.util.concurrent.Futures.immediateFuture;
 import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
+import static com.google.common.util.concurrent.TestPlatform.clearInterrupt;
 
 import com.google.common.annotations.GwtCompatible;
 import com.google.common.base.Function;
 import com.google.common.base.Functions;
+import com.google.common.collect.Lists;
+import com.google.common.testing.TestLogHandler;
 
 import junit.framework.AssertionFailedError;
 import junit.framework.TestCase;
@@ -36,6 +41,8 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 /**
  * Unit tests for {@link Futures}.
@@ -45,10 +52,32 @@ import java.util.concurrent.TimeUnit;
 @SuppressWarnings("CheckReturnValue")
 @GwtCompatible(emulated = true)
 public class FuturesTest extends TestCase {
+  private static final Logger aggregateFutureLogger =
+      Logger.getLogger(AggregateFuture.class.getName());
+  private final TestLogHandler aggregateFutureLogHandler = new TestLogHandler();
 
   private static final String DATA1 = "data";
   private static final String DATA2 = "more data";
   private static final String DATA3 = "most data";
+
+  @Override
+  protected void setUp() throws Exception {
+    super.setUp();
+    aggregateFutureLogger.addHandler(aggregateFutureLogHandler);
+  }
+
+  @Override
+  protected void tearDown() throws Exception {
+    /*
+     * Clear interrupt for future tests.
+     *
+     * (Ideally we would perform interrupts only in threads that we create, but
+     * it's hard to imagine that anything will break in practice.)
+     */
+    clearInterrupt();
+    aggregateFutureLogger.removeHandler(aggregateFutureLogHandler);
+    super.tearDown();
+  }
 
   public void testImmediateFuture() throws Exception {
     ListenableFuture<String> future = Futures.immediateFuture(DATA1);
@@ -64,6 +93,35 @@ public class FuturesTest extends TestCase {
     // Verify that the proper objects are returned without waiting
     assertSame(DATA1, future1.get(0L, TimeUnit.MILLISECONDS));
     assertSame(DATA2, future2.get(0L, TimeUnit.MILLISECONDS));
+  }
+
+  public void testImmediateFailedFuture() throws Exception {
+    Exception exception = new Exception();
+    ListenableFuture<String> future =
+        Futures.immediateFailedFuture(exception);
+
+    try {
+      future.get(0L, TimeUnit.MILLISECONDS);
+      fail("This call was supposed to throw an ExecutionException");
+    } catch (ExecutionException expected) {
+      // This is good and expected
+      assertSame(exception, expected.getCause());
+    }
+  }
+
+  public void testImmediateFailedFuture_cancellationException() throws Exception {
+    CancellationException exception = new CancellationException();
+    ListenableFuture<String> future =
+        Futures.immediateFailedFuture(exception);
+
+    try {
+      future.get(0L, TimeUnit.MILLISECONDS);
+      fail("This call was supposed to throw an ExecutionException");
+    } catch (ExecutionException expected) {
+      // This is good and expected
+      assertSame(exception, expected.getCause());
+      assertFalse(future.isCancelled());
+    }
   }
 
   private static class MyException extends Exception {
@@ -1215,6 +1273,175 @@ public class FuturesTest extends TestCase {
     assertThat(results).containsExactly(DATA1, DATA2, DATA3).inOrder();
   }
 
+  /**
+   * A single non-error failure is not logged because it is reported via the output future.
+   */
+  @SuppressWarnings("unchecked")
+  public void testAllAsList_logging_exception() throws Exception {
+    try {
+      Futures.allAsList(immediateFailedFuture(new MyException())).get();
+      fail();
+    } catch (ExecutionException e) {
+      assertThat(e.getCause()).isInstanceOf(MyException.class);
+      assertEquals(
+          "Nothing should be logged", 0, aggregateFutureLogHandler.getStoredLogRecords().size());
+    }
+  }
+
+  /**
+   * Ensure that errors are always logged.
+   */
+  @SuppressWarnings("unchecked")
+  public void testAllAsList_logging_error() throws Exception {
+    try {
+      Futures.allAsList(immediateFailedFuture(new MyError())).get();
+      fail();
+    } catch (ExecutionException e) {
+      assertThat(e.getCause()).isInstanceOf(MyError.class);
+      List<LogRecord> logged = aggregateFutureLogHandler.getStoredLogRecords();
+      assertThat(logged).hasSize(1); // errors are always logged
+      assertThat(logged.get(0).getThrown()).isInstanceOf(MyError.class);
+    }
+  }
+
+  /**
+   * All as list will log extra exceptions that have already occurred.
+   */
+  @SuppressWarnings("unchecked")
+  public void testAllAsList_logging_multipleExceptions_alreadyDone() throws Exception {
+    try {
+      Futures.allAsList(immediateFailedFuture(new MyException()),
+          immediateFailedFuture(new MyException())).get();
+      fail();
+    } catch (ExecutionException e) {
+      assertThat(e.getCause()).isInstanceOf(MyException.class);
+      List<LogRecord> logged = aggregateFutureLogHandler.getStoredLogRecords();
+      assertThat(logged).hasSize(1); // the second failure is logged
+      assertThat(logged.get(0).getThrown()).isInstanceOf(MyException.class);
+    }
+  }
+
+  /**
+   * All as list will log extra exceptions that occur later.
+   */
+  @SuppressWarnings("unchecked")
+  public void testAllAsList_logging_multipleExceptions_doneLater() throws Exception {
+    SettableFuture<Object> future1 = SettableFuture.create();
+    SettableFuture<Object> future2 = SettableFuture.create();
+    SettableFuture<Object> future3 = SettableFuture.create();
+    ListenableFuture<List<Object>> all = Futures.allAsList(future1, future2, future3);
+
+    future1.setException(new MyException());
+    future2.setException(new MyException());
+    future3.setException(new MyException());
+
+    try {
+      all.get();
+    } catch (ExecutionException e) {
+      List<LogRecord> logged = aggregateFutureLogHandler.getStoredLogRecords();
+      assertThat(logged).hasSize(2); // failures after the first are logged
+      assertThat(logged.get(0).getThrown()).isInstanceOf(MyException.class);
+      assertThat(logged.get(1).getThrown()).isInstanceOf(MyException.class);
+    }
+  }
+
+  /**
+   * The same exception happening on multiple futures should not be logged.
+   */
+  @SuppressWarnings("unchecked")
+  public void testAllAsList_logging_same_exception() throws Exception {
+    try {
+      MyException sameInstance = new MyException();
+      Futures.allAsList(immediateFailedFuture(sameInstance),
+          immediateFailedFuture(sameInstance)).get();
+      fail();
+    } catch (ExecutionException e) {
+      assertThat(e.getCause()).isInstanceOf(MyException.class);
+      assertEquals(
+          "Nothing should be logged", 0, aggregateFutureLogHandler.getStoredLogRecords().size());
+    }
+  }
+
+  public void testAllAsList_logging_seenExceptionUpdateRace() throws Exception {
+    final MyException sameInstance = new MyException();
+    SettableFuture<Object> firstFuture = SettableFuture.create();
+    final SettableFuture<Object> secondFuture = SettableFuture.create();
+    ListenableFuture<List<Object>> bulkFuture = allAsList(firstFuture, secondFuture);
+
+    bulkFuture.addListener(new Runnable() {
+      @Override
+      public void run() {
+        /*
+         * firstFuture just completed, but AggregateFuture hasn't yet had time to record the
+         * exception in seenExceptions. When we complete secondFuture with the same exception,
+         * we want for AggregateFuture to still detect that it's been previously seen.
+         */
+        secondFuture.setException(sameInstance);
+      }
+    }, directExecutor());
+    firstFuture.setException(sameInstance);
+
+    try {
+      bulkFuture.get();
+      fail();
+    } catch (ExecutionException expected) {
+      assertThat(expected.getCause()).isInstanceOf(MyException.class);
+      assertThat(aggregateFutureLogHandler.getStoredLogRecords()).isEmpty();
+    }
+  }
+
+  public void testAllAsList_logging_seenExceptionUpdateCancelRace() throws Exception {
+    final MyException subsequentFailure = new MyException();
+    SettableFuture<Object> firstFuture = SettableFuture.create();
+    final SettableFuture<Object> secondFuture = SettableFuture.create();
+    ListenableFuture<List<Object>> bulkFuture = allAsList(firstFuture, secondFuture);
+
+    bulkFuture.addListener(new Runnable() {
+      @Override
+      public void run() {
+        /*
+         * This is similar to the above test, but this time we're making sure that we recognize that
+         * the output Future is done early not because of an exception but because of a
+         * cancellation.
+         */
+        secondFuture.setException(subsequentFailure);
+      }
+    }, directExecutor());
+    firstFuture.cancel(false);
+
+    try {
+      bulkFuture.get();
+      fail();
+    } catch (CancellationException expected) {
+      assertThat(getOnlyElement(aggregateFutureLogHandler.getStoredLogRecords()).getThrown())
+          .isSameAs(subsequentFailure);
+    }
+  }
+
+  /**
+   * Different exceptions happening on multiple futures with the same cause should not be logged.
+   */
+  @SuppressWarnings("unchecked")
+  public void testAllAsList_logging_same_cause() throws Exception {
+    try {
+      MyException exception1 = new MyException();
+      MyException exception2 = new MyException();
+      MyException exception3 = new MyException();
+
+      MyException sameInstance = new MyException();
+      exception1.initCause(sameInstance);
+      exception2.initCause(sameInstance);
+      exception3.initCause(exception2);
+      Futures.allAsList(immediateFailedFuture(exception1),
+          immediateFailedFuture(exception3)).get();
+      fail();
+    } catch (ExecutionException e) {
+      assertThat(e.getCause()).isInstanceOf(MyException.class);
+      assertEquals(
+          "Nothing should be logged", 0, aggregateFutureLogHandler.getStoredLogRecords().size());
+    }
+  }
+
   private static String createCombinedResult(Integer i, Boolean b) {
     return "-" + i + "-" + b;
   }
@@ -1224,17 +1451,39 @@ public class FuturesTest extends TestCase {
    * ListenableFuture instances
    */
 
-  private static final class OtherThrowable extends Throwable {
+  /**
+   * Non-Error exceptions are never logged.
+   */
+  @SuppressWarnings("unchecked")
+  public void testSuccessfulAsList_logging_exception() throws Exception {
+    assertEquals(Lists.newArrayList((Object) null),
+        Futures.successfulAsList(
+            immediateFailedFuture(new MyException())).get());
+    assertEquals("Nothing should be logged", 0,
+        aggregateFutureLogHandler.getStoredLogRecords().size());
 
+    // Not even if there are a bunch of failures.
+    assertEquals(Lists.newArrayList(null, null, null),
+        Futures.successfulAsList(
+            immediateFailedFuture(new MyException()),
+            immediateFailedFuture(new MyException()),
+            immediateFailedFuture(new MyException())).get());
+    assertEquals("Nothing should be logged", 0,
+        aggregateFutureLogHandler.getStoredLogRecords().size());
   }
 
-  // Boring untimed-get tests:
-
-  // Boring timed-get tests:
-
-  // Boring getUnchecked tests:
-
-  // Edge case tests of the exception-construction code through untimed get():
+  /**
+   * Ensure that errors are always logged.
+   */
+  @SuppressWarnings("unchecked")
+  public void testSuccessfulAsList_logging_error() throws Exception {
+    assertEquals(Lists.newArrayList((Object) null),
+        Futures.successfulAsList(
+            immediateFailedFuture(new MyError())).get());
+    List<LogRecord> logged = aggregateFutureLogHandler.getStoredLogRecords();
+    assertThat(logged).hasSize(1); // errors are always logged
+    assertThat(logged.get(0).getThrown()).isInstanceOf(MyError.class);
+  }
 
   // Mostly an example of how it would look like to use a list of mixed types
 

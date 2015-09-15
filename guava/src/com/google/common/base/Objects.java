@@ -29,7 +29,7 @@ import javax.annotation.Nullable;
  * Helper functions that can operate on any {@code Object}.
  *
  * <p>See the Guava User Guide on <a
- * href="http://code.google.com/p/guava-libraries/wiki/CommonObjectUtilitiesExplained">writing
+ * href="https://github.com/google/guava/wiki/CommonObjectUtilitiesExplained">writing
  * {@code Object} methods with {@code Objects}</a>.
  *
  * @author Laurence Gonsalves
@@ -387,13 +387,14 @@ public final class Objects {
      * limited reuse of the helper instance. The helper allows duplication of
      * properties (multiple name/value pairs with the same name can be added).
      */
-    @Override public String toString() {
+    @Override
+    public String toString() {
       // create a copy to keep it consistent in case value changes
       boolean omitNullValuesSnapshot = omitNullValues;
       String nextSeparator = "";
-      StringBuilder builder = new StringBuilder(32).append(className)
-          .append('{');
-      for (ValueHolder valueHolder = holderHead.next; valueHolder != null;
+      StringBuilder builder = new StringBuilder(32).append(className).append('{');
+      for (ValueHolder valueHolder = holderHead.next;
+          valueHolder != null;
           valueHolder = valueHolder.next) {
         if (!omitNullValuesSnapshot || valueHolder.value != null) {
           builder.append(nextSeparator);
